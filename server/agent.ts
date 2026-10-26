@@ -77,6 +77,44 @@ class ProviderError extends Error {
   }
 }
 
+function looksLikeHtml(text: string, contentType = ''): boolean {
+  if (contentType.includes('text/html')) return true
+  const head = text.trimStart().slice(0, 200).toLowerCase()
+  return head.startsWith('<!doctype') || head.startsWith('<html')
+}
+
+function notAnApiResponse(url: string, body: string, contentType: string): string {
+  const kind = looksLikeHtml(body, contentType) ? 'an HTML web page' : `unexpected data (${contentType || 'no content type'})`
+  const snippet = looksLikeHtml(body, contentType) ? '' : `\n\n${body.replace(/\s+/g, ' ').slice(0, 200)}`
+  return (
+    `${url} returned ${kind} instead of an OpenAI-compatible chat completion. ` +
+    `The API key is not the problem — check the base URL (most end in /v1) and that the server exposes /chat/completions.${snippet}`
+  )
+}
+
+function completionFromPayload(payload: any, onText: (text: string) => void): StreamOutcome {
+  if (payload?.error) {
+    throw new ProviderError(payload.error.message ?? JSON.stringify(payload.error))
+  }
+  const message = payload?.choices?.[0]?.message ?? {}
+  const text = typeof message.content === 'string' ? message.content : ''
+  if (text) onText(text)
+  const toolCalls: ToolCall[] = Array.isArray(message.tool_calls)
+    ? message.tool_calls.map((call: any, index: number) => ({
+        id: call.id ?? `call_${index}`,
+        type: 'function' as const,
+        function: {
+          name: call.function?.name ?? '',
+          arguments:
+            typeof call.function?.arguments === 'string'
+              ? call.function.arguments
+              : JSON.stringify(call.function?.arguments ?? {}),
+        },
+      }))
+    : []
+  return { text, toolCalls }
+}
+
 function explainHttpError(status: number, body: string): string {
   const snippet = body.replace(/\s+/g, ' ').slice(0, 400)
   const hint = (() => {
@@ -155,27 +193,29 @@ async function streamCompletion(options: {
 
   // Some gateways ignore stream: true and answer with one JSON document.
   if (contentType.includes('application/json')) {
-    const payload = (await response.json()) as any
-    if (payload?.error) {
-      throw new ProviderError(payload.error.message ?? JSON.stringify(payload.error))
+    const raw = await response.text()
+    let payload: any
+    try {
+      payload = JSON.parse(raw)
+    } catch {
+      throw new ProviderError(notAnApiResponse(url, raw, contentType))
     }
-    const message = payload?.choices?.[0]?.message ?? {}
-    const text = typeof message.content === 'string' ? message.content : ''
-    if (text) onText(text)
-    const toolCalls: ToolCall[] = Array.isArray(message.tool_calls)
-      ? message.tool_calls.map((call: any, index: number) => ({
-          id: call.id ?? `call_${index}`,
-          type: 'function',
-          function: {
-            name: call.function?.name ?? '',
-            arguments:
-              typeof call.function?.arguments === 'string'
-                ? call.function.arguments
-                : JSON.stringify(call.function?.arguments ?? {}),
-          },
-        }))
-      : []
-    return { text, toolCalls }
+    return completionFromPayload(payload, onText)
+  }
+
+  // Anything that is not a stream and not JSON is almost always a web page
+  // from a wrong base URL; say so instead of silently returning an empty reply.
+  if (!contentType.includes('text/event-stream')) {
+    const raw = await response.text().catch(() => '')
+    if (!raw.trim() || looksLikeHtml(raw, contentType)) {
+      throw new ProviderError(notAnApiResponse(url, raw, contentType))
+    }
+    try {
+      return completionFromPayload(JSON.parse(raw), onText)
+    } catch (error) {
+      if (error instanceof ProviderError) throw error
+      throw new ProviderError(notAnApiResponse(url, raw, contentType || 'unknown content type'))
+    }
   }
 
   if (!response.body) throw new ProviderError('The provider returned an empty response body.')

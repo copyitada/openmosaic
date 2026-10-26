@@ -172,6 +172,22 @@ app.post('/api/chat', async (req: Request, res: Response) => {
   }
 })
 
+function looksLikeHtml(text: string, contentType: string): boolean {
+  if (contentType.includes('text/html')) return true
+  const head = text.trimStart().slice(0, 200).toLowerCase()
+  return head.startsWith('<!doctype') || head.startsWith('<html')
+}
+
+function explainStatus(status: number): string {
+  if (status === 401 || status === 403) return 'The provider rejected the key.'
+  if (status === 404) return 'No API at that path. Most base URLs end in /v1.'
+  if (status === 402) return 'The provider says this key has no credit left.'
+  if (status === 429) return 'Rate limited or out of quota.'
+  if (status >= 500) return 'The provider had a server error.'
+  if (status === 400) return 'The provider rejected the request — check the model name.'
+  return 'The provider refused the request.'
+}
+
 /** Tiny non-streaming round trip so users can verify a key before chatting. */
 app.post('/api/test', async (req: Request, res: Response) => {
   let provider: ProviderConfig
@@ -205,17 +221,43 @@ app.post('/api/test', async (req: Request, res: Response) => {
     })
     const text = await response.text()
     const elapsedMs = Date.now() - startedAt
+    const contentType = response.headers.get('content-type') ?? ''
+
     if (!response.ok) {
-      res.json({ ok: false, message: `HTTP ${response.status} — ${text.slice(0, 300)}` })
+      const body = looksLikeHtml(text, contentType) || !text.trim() ? '' : ` — ${text.slice(0, 300)}`
+      res.json({ ok: false, message: `${explainStatus(response.status)} (HTTP ${response.status})${body}` })
       return
     }
-    let reply = ''
+
+    let json: any
     try {
-      const json = JSON.parse(text)
-      reply = json?.choices?.[0]?.message?.content ?? ''
+      json = JSON.parse(text)
     } catch {
-      reply = text.slice(0, 120)
+      // A web page came back instead of an API response: the URL is wrong, not the key.
+      res.json({
+        ok: false,
+        message:
+          `${url} answered with ${looksLikeHtml(text, contentType) ? 'a web page' : 'non-JSON data'} ` +
+          `instead of an OpenAI-compatible response. The key was not the problem — check the base URL ` +
+          `(most end in /v1) and that the server exposes /chat/completions.`,
+      })
+      return
     }
+
+    if (json?.error) {
+      res.json({ ok: false, message: json.error.message ?? JSON.stringify(json.error) })
+      return
+    }
+
+    const reply = typeof json?.choices?.[0]?.message?.content === 'string' ? json.choices[0].message.content : ''
+    if (!Array.isArray(json?.choices)) {
+      res.json({
+        ok: false,
+        message: `${url} replied, but without a chat completion (no "choices"). Check that the base URL points at an OpenAI-compatible API.`,
+      })
+      return
+    }
+
     res.json({ ok: true, elapsedMs, message: `Connected to ${provider.model}`, reply })
   } catch (error) {
     res.json({ ok: false, message: (error as Error).message })

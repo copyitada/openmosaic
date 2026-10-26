@@ -189,6 +189,29 @@ try {
   await page.locator('.theme-toggle').click()
 
   console.log('\nError handling')
+  // Regression: the app server (or a proxy in front of it) answering with an HTML page
+  // must produce a plain explanation, never "... is not valid JSON".
+  await page.route('**/api/test', (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: 'text/html; charset=utf-8',
+      body: '<!DOCTYPE html><html><body><h1>The page could not be found</h1></body></html>',
+    }),
+  )
+  await page.locator('.topbar-actions .icon-btn').last().click()
+  await page.waitForSelector('.modal')
+  await page.getByRole('button', { name: 'Test connection' }).click()
+  await page.waitForSelector('.test-result.fail', { timeout: 15_000 })
+  const htmlResult = (await page.textContent('.test-result.fail')) ?? ''
+  check(
+    'HTML response is explained instead of a JSON syntax error',
+    htmlResult.includes('did not answer with data') && !/is not valid JSON/i.test(htmlResult),
+    htmlResult,
+  )
+  await page.getByRole('button', { name: 'Cancel' }).click()
+  await page.waitForSelector('.modal', { state: 'detached' })
+  await page.unroute('**/api/test')
+
   await page.locator('.topbar-actions .icon-btn').last().click()
   await page.waitForSelector('.modal')
   await page.fill('#base-url', 'http://127.0.0.1:4999/v1')
